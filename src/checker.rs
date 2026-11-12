@@ -131,7 +131,10 @@ impl Checker {
         }
     }
 
-    /// Load (or reload) config. Note in the case of reloading, APIs are only ever additive.
+    /// Load (or reload) config. In the case of reloading, the in-memory permissions are replaced
+    /// by those of the new configuration, so revoking a permission takes effect immediately. If
+    /// parsing or writing the flattened configuration fails, our in-memory configuration is left
+    /// unchanged.
     pub(crate) fn load_config(&mut self) -> Result<()> {
         let config = crate::config::parse_file(&self.config_path, &self.crate_index)?;
         // Every time we reload our configuration, we rewrite the flattened configuration. The
@@ -151,6 +154,10 @@ impl Checker {
             &SubprocessConfig::from_full_config(&config).serialise()?,
         )?;
 
+        // Only update our in-memory configuration after the flattened configuration has been
+        // written. That way, once this function returns, running subprocesses and any subsequently
+        // started rustc processes see the same generation of the configuration as we hold in
+        // memory.
         self.update_config(config);
         info!("Config (re)loaded");
         Ok(())
@@ -192,25 +199,40 @@ impl Checker {
                     });
             }
         }
-        // First apply permissions without inheritance, updating our unused_allow_apis records for
-        // each selector.
+        // Replace our in-memory permissions with those of the new configuration. Permissions that
+        // were revoked since the last load stop having effect immediately.
+        let mut new_crate_infos: FxHashMap<PermSel, CrateInfo> = FxHashMap::default();
+        // First apply permissions without inheritance, initialising our unused_allow_apis records
+        // for each selector.
         for (perm_sel, crate_config) in &config.permissions_no_inheritance.packages {
-            let crate_info = self.crate_infos.entry(perm_sel.clone()).or_default();
+            let crate_info = new_crate_infos.entry(perm_sel.clone()).or_default();
             for api in &crate_config.allow_apis {
-                if crate_info.allowed_apis.insert(api.clone()) {
-                    crate_info.unused_allowed_apis.insert(api.clone());
-                }
+                crate_info.allowed_apis.insert(api.clone());
+                crate_info.unused_allowed_apis.insert(api.clone());
             }
         }
         // Then process with inheritance, but leaving unused_allow_apis alone. We don't want to get
         // warnings that an allow_api was unused when it was inherited and was actually used
         // elsewhere in the inheritance tree.
         for (perm_sel, crate_config) in &config.permissions.packages {
-            let crate_info = self.crate_infos.entry(perm_sel.clone()).or_default();
+            let crate_info = new_crate_infos.entry(perm_sel.clone()).or_default();
             for api in &crate_config.allow_apis {
                 crate_info.allowed_apis.insert(api.clone());
             }
         }
+        // Carry over which APIs have been observed as used from the previous configuration, so
+        // that reloading doesn't cause APIs that were already used to be reported as unused.
+        for (perm_sel, old_info) in &self.crate_infos {
+            if let Some(new_info) = new_crate_infos.get_mut(perm_sel) {
+                for used_api in old_info
+                    .allowed_apis
+                    .difference(&old_info.unused_allowed_apis)
+                {
+                    new_info.unused_allowed_apis.remove(used_api);
+                }
+            }
+        }
+        self.crate_infos = new_crate_infos;
         self.config = config;
     }
 
@@ -709,5 +731,202 @@ mod tests {
         // Now reload the config and make that we still don't report any unused configuration.
         checker.update_config(config);
         assert!(checker.check_unused().unwrap().is_empty());
+    }
+
+    const CONFIG_ALLOW_FS: &str = r#"
+        [common]
+        version = 1
+
+        [api.fs]
+        include = ["std::fs"]
+
+        [pkg.foo]
+        allow_apis = ["fs"]
+    "#;
+
+    const CONFIG_NO_ALLOW: &str = r#"
+        [common]
+        version = 1
+
+        [api.fs]
+        include = ["std::fs"]
+    "#;
+
+    fn api_usages(pkg_name: &str, api_name: &str) -> ApiUsages {
+        ApiUsages {
+            pkg_id: crate::crate_index::testing::pkg_id(pkg_name),
+            scope: PermissionScope::All,
+            api_name: ApiName::new(api_name),
+            usages: vec![ApiUsage {
+                bin_location: BinLocation {
+                    address: 0,
+                    symbol_start: 0,
+                },
+                bin_path: Arc::from(Path::new("bin")),
+                permission_scope: PermissionScope::All,
+                source_location: SourceLocation::new(Path::new("lib.rs"), 1, None),
+                outer_location: None,
+                from: SymbolOrDebugName::Symbol(Symbol::borrowed(&[])),
+                to_name: crate::names::split_simple("foo::bar"),
+                to: SymbolOrDebugName::Symbol(Symbol::borrowed(&[])),
+                to_source: NameSource::Symbol(Symbol::borrowed(b"foo::bar")),
+                debug_data: None,
+            }],
+        }
+    }
+
+    fn checker_with_config_file(config_text: &str) -> (Checker, Arc<TempDir>, PathBuf) {
+        let tmpdir = Arc::new(TempDir::new(None).unwrap());
+        let config_path = tmpdir.path().join("cackle.toml");
+        std::fs::write(&config_path, config_text).unwrap();
+        let checker = Checker::new(
+            tmpdir.clone(),
+            PathBuf::default(),
+            Arc::new(Args::default()),
+            Arc::from(Path::new("")),
+            crate::crate_index::testing::index_with_package_names(&["foo"]),
+            config_path.clone(),
+        );
+        (checker, tmpdir, config_path)
+    }
+
+    /// Revoking an API permission in cackle.toml then reloading should take effect immediately,
+    /// rather than the old permission remaining in effect until the process exits.
+    #[test]
+    fn revoked_permission_takes_effect_on_reload() {
+        let (mut checker, _tmpdir, config_path) = checker_with_config_file(CONFIG_ALLOW_FS);
+        checker.load_config().unwrap();
+
+        let mut problems = ProblemList::default();
+        checker
+            .api_used(&api_usages("foo", "fs"), &mut problems)
+            .unwrap();
+        assert!(problems.is_empty());
+
+        // Revoke the permission and reload. The same usage should now be reported.
+        std::fs::write(&config_path, CONFIG_NO_ALLOW).unwrap();
+        checker.load_config().unwrap();
+        checker
+            .api_used(&api_usages("foo", "fs"), &mut problems)
+            .unwrap();
+        assert_eq!(problems.len(), 1);
+        assert!(matches!(problems[0], Problem::DisallowedApiUsage(_)));
+    }
+
+    /// Reloading the config shouldn't clear our records of which allow_apis are unused, nor which
+    /// configured packages are unknown.
+    #[test]
+    fn reload_still_reports_unused_and_unknown() {
+        let config = parse(
+            r#"
+            [api.fs]
+            include = ["std::fs"]
+            [pkg.foo]
+            allow_apis = ["fs"]
+            [pkg.unknown]
+            allow_apis = ["fs"]
+        "#,
+        )
+        .unwrap();
+        let mut checker = Checker {
+            crate_index: crate::crate_index::testing::index_with_package_names(&["foo"]),
+            ..checker_for_testing()
+        };
+        checker.update_config(config.clone());
+        checker.update_config(config);
+
+        let problems = checker.check_unused().unwrap();
+        assert!((&problems).into_iter().any(|problem| matches!(
+            problem,
+            Problem::UnusedAllowApi(unused)
+                if unused.perm_sel == PermSel::for_primary("foo")
+                    && unused.apis == [ApiName::from("fs")]
+        )));
+        assert!((&problems).into_iter().any(|problem| matches!(
+            problem,
+            Problem::UnusedPackageConfig(perm_sel)
+                if *perm_sel == PermSel::for_primary("unknown")
+        )));
+    }
+
+    /// If reloading the config fails, e.g. because the new config is invalid, then both our
+    /// in-memory config and the flattened config seen by subprocesses should remain at the
+    /// previous generation.
+    #[test]
+    fn failed_reload_leaves_previous_config_in_effect() {
+        let (mut checker, tmpdir, config_path) = checker_with_config_file(CONFIG_ALLOW_FS);
+        checker.load_config().unwrap();
+
+        let mut problems = ProblemList::default();
+        checker
+            .api_used(&api_usages("foo", "fs"), &mut problems)
+            .unwrap();
+        assert!(problems.is_empty());
+
+        std::fs::write(&config_path, "this is not valid toml = [").unwrap();
+        assert!(checker.load_config().is_err());
+
+        // The old permission should still be in effect.
+        checker
+            .api_used(&api_usages("foo", "fs"), &mut problems)
+            .unwrap();
+        assert!(problems.is_empty());
+
+        // The flattened config should still be the same generation as our in-memory config.
+        let flattened_path = crate::config::flattened_config_path(tmpdir.path());
+        let flattened = std::fs::read_to_string(&flattened_path).unwrap();
+        let subprocess_config: SubprocessConfig = serde_json::from_str(&flattened).unwrap();
+        assert_eq!(
+            subprocess_config,
+            SubprocessConfig::from_full_config(&checker.config)
+        );
+    }
+
+    /// While the config is being reloaded, other processes reading the flattened config should
+    /// only ever see a complete old or new generation, never a partially written file. And once
+    /// each reload completes, the on-disk flattened config should be the same generation as our
+    /// in-memory config.
+    #[test]
+    fn concurrent_reads_see_consistent_config_generations() {
+        let (mut checker, tmpdir, config_path) = checker_with_config_file(CONFIG_ALLOW_FS);
+        checker.load_config().unwrap();
+        let expected_allow = SubprocessConfig::from_full_config(&checker.config);
+        std::fs::write(&config_path, CONFIG_NO_ALLOW).unwrap();
+        checker.load_config().unwrap();
+        let expected_no_allow = SubprocessConfig::from_full_config(&checker.config);
+        assert_ne!(expected_allow, expected_no_allow);
+
+        let flattened_path = crate::config::flattened_config_path(tmpdir.path());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let flattened_path = flattened_path.clone();
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let content = std::fs::read_to_string(&flattened_path).unwrap();
+                    let config: SubprocessConfig = serde_json::from_str(&content)
+                        .expect("Read a partially written flattened config");
+                    assert!(
+                        config == expected_allow || config == expected_no_allow,
+                        "Read a flattened config that is neither the old nor the new generation"
+                    );
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            std::fs::write(&config_path, CONFIG_ALLOW_FS).unwrap();
+            checker.load_config().unwrap();
+            std::fs::write(&config_path, CONFIG_NO_ALLOW).unwrap();
+            checker.load_config().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // After the final reload, the on-disk flattened config is the same generation as our
+        // in-memory config.
+        let content = std::fs::read_to_string(&flattened_path).unwrap();
+        let config: SubprocessConfig = serde_json::from_str(&content).unwrap();
+        assert_eq!(config, SubprocessConfig::from_full_config(&checker.config));
     }
 }
